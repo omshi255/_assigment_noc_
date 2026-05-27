@@ -1,4 +1,5 @@
 import time
+from collections import defaultdict, deque
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +19,29 @@ from ..llm.prompts import OUT_OF_SCOPE_RESPONSE, NO_RESULTS_RESPONSE
 
 router = APIRouter()
 
+# Per-user sliding-window rate limiter (no external dependency)
+# key: username -> deque of request timestamps (floats)
+_request_log: dict = defaultdict(deque)
+
+def _check_rate_limit(username: str, limit: int) -> None:
+    """Enforce a per-user rate limit using a 60-second sliding window.
+
+    Raises HTTP 429 if the user has exceeded ``limit`` requests in the last
+    60 seconds. Thread-safe for a single-process Uvicorn worker.
+    """
+    now = time.time()
+    window = _request_log[username]
+    # Evict timestamps older than 60 s
+    while window and window[0] < now - 60:
+        window.popleft()
+    if len(window) >= limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded: max {limit} queries per minute. Please wait before retrying.",
+        )
+    window.append(now)
+
+
 class QueryRequest(BaseModel):
     message: str
 
@@ -28,9 +52,15 @@ async def run_query(
     current_user: dict = Depends(get_current_user),
 ):
     """Execute a natural language query with enterprise security, caching, and timing."""
-    # Prompt injection and security scan early-exit
     from ..security.prompt_guard import scan_query
+    from ..config import get_settings
+
     username = current_user.get("username", "unknown")
+
+    # 0. Rate limit check — must run before any expensive processing
+    settings = get_settings()
+    _check_rate_limit(username, settings.RATE_LIMIT_PER_MINUTE)
+
     guard_res = await scan_query(payload.message, username, db)
     if guard_res["blocked"]:
         raise HTTPException(

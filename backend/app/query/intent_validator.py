@@ -14,8 +14,8 @@ class DeviceInventoryFilters(BaseModel):
 
     @model_validator(mode='after')
     def check_at_least_one(cls, values):
-        if not values.device_type and not values.vendor:
-            raise ValueError('At least one of device_type or vendor must be provided')
+        if not values.device_type and not values.vendor and not values.location_code:
+            raise ValueError('At least one of device_type, vendor, or location_code must be provided')
         return values
 
 class InterfaceMetricsFilters(BaseModel):
